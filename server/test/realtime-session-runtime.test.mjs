@@ -1,0 +1,1027 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { config } from '../src/core/config.mjs'
+import { DASHSCOPE_AUDIO_30_REALTIME_MODEL } from '../../shared/realtime-provider-catalog.mjs'
+import { createRealtimeSessionRuntime, permissionResponseGate } from '../src/voice/realtime-session-runtime.mjs'
+import { RealtimeFrontend, REALTIME_PROVIDERS } from '../src/voice/realtime-provider.mjs'
+import { SessionObservers } from '../src/voice/session-observers.mjs'
+import { InputAssetRegistry } from '../src/voice/input-asset-registry.mjs'
+import { createTaskAnnouncementRuntime } from '../src/voice/announcement/task-announcement-runtime.mjs'
+import { ConversationSync } from '../src/conversation/conversation-sync.mjs'
+import { TaskManager } from '../src/task/task-manager.mjs'
+import { TaskOperations } from '../src/orchestration/task-operations.mjs'
+import { clientActionCapabilities, ClientActionName } from '../src/client/client-action-port.mjs'
+import { GatewayClientEvent as Input } from '../../shared/protocol/realtime-events.mjs'
+import { GatewayEventRouter } from '../src/client/client-event-router.mjs'
+import { desktopClientTools } from '../../web/src/desktop/client-tools.js'
+
+const tick = () => new Promise(resolve => setImmediate(resolve))
+async function until(predicate) {
+  const deadline = Date.now() + 2000
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, 'runtime condition timed out')
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+}
+
+function harness(t, {
+  backend = true, ownerId = 'runtime-owner', sessionId = 'conversation',
+  taskManager = new TaskManager(), ...overrides
+} = {}) {
+  const events = [], frontends = [], tasks = [], observations = [], done = [], logs = []
+  const runs = new Map(), memoryListeners = new Set()
+  const manager = taskManager
+  const conversationSync = new ConversationSync()
+  const logger = Object.fromEntries(['info', 'warn', 'error', 'debug'].map(level => [
+    level, (event, fields = {}) => logs.push({ level, event, fields }),
+  ]))
+  const provider = {
+    key: 'test', label: 'Test', inputSampleRate: 16000, outputSampleRate: 24000,
+    capabilities: { sessionOutputVoice: true },
+    classifyError: message => message === 'input busy' ? 'input_busy'
+      : message === 'unsafe' ? 'content_safety' : 'other',
+  }
+  const backendRuntime = {
+    run: (_input, execution) => new Promise((resolve, reject) => {
+      runs.set(execution.taskId, { ...execution, resolve })
+      execution.signal.addEventListener('abort', () => reject(execution.signal.reason), { once: true })
+    }),
+    cancel: async () => ({ layer: 'backend', state: 'cancelled' }),
+  }
+  const operations = new TaskOperations({ taskManager: manager, backendRuntime })
+  let active = false
+  const runtime = createRealtimeSessionRuntime({
+    ownerId, sessionId, logger, taskManager: manager, taskOperations: operations,
+    backendRuntime, backendAvailability: { snapshot: () => ({ configured: backend, ok: backend, known: true }) },
+    send: event => events.push(event), onTaskEvent: event => tasks.push(event),
+    onResponseDone: event => done.push(event),
+    observers: new SessionObservers([{
+      onAudio: event => observations.push(event),
+      onSessionClosed: event => observations.push({ ...event, closed: true }),
+    }]),
+    voiceAccess: {
+      isActive: () => active,
+      claim: () => { active = true; return { granted: true } },
+      release: () => { const wasActive = active; active = false; return wasActive },
+      changed() {},
+    },
+    actionCapabilities: clientActionCapabilities(),
+    frontendToolSources: [],
+    memoryService: {
+      list: () => [{ id: 'memory-1', content: 'test preference' }],
+      subscribe(listener) { memoryListeners.add(listener); return () => memoryListeners.delete(listener) },
+    },
+    inputAssets: new InputAssetRegistry(), conversationSync,
+    config: { sleepTimeoutMs: 0, announcementQuietMs: 0, announcementBatchMs: 0, taskNotificationClaimTtlMs: 60000 },
+    realtimeProviderRegistry: { resolve: () => provider }, defaultRealtimeProvider: 'test',
+    taskAnnouncementFactory: createTaskAnnouncementRuntime,
+    realtimeFrontendFactory: options => {
+      const f = {
+        provider, ready: false, inputs: [], audio: [], images: [], outputs: [], deliveries: [], updates: [], cancels: 0,
+        initialContext: options.agentContext, sessionOptions: options.sessionOptions,
+        async connect() { this.ready = true },
+        close() { this.ready = false },
+        cancel() { this.cancels++ }, cancelResponses() {}, clearPendingImage() {},
+        appendAudio(value) { this.audio.push(value) },
+        appendImage(value) { this.images.push(value) },
+        updateAgentContext(context, settings) { this.updates.push({ context, settings }) },
+        async sendUserInput(parts, context) { this.inputs.push({ parts, context }); return {} },
+        async sendFunctionOutput(callId, result, context, settings) { this.outputs.push({ callId, result, context, settings }) },
+        async injectDelivery(text, origin, context, settings) {
+          if (settings.shouldRespond && !settings.shouldRespond()) return { completed: false }
+          this.deliveries.push({ text, origin, context, settings })
+          return { completed: true, contextInjected: true }
+        },
+        async appendUserInputContext() {}, async ensureResponse() {}, async whenIdle() {},
+        emit: options.onEvent,
+        diagnose: options.onDiagnostic,
+        settle: options.onResponseSettled,
+        disconnect() { this.ready = false; options.onClose() },
+      }
+      frontends.push(f)
+      return f
+    },
+    ...overrides,
+  })
+  const send = (event, options) => runtime.handleClientEvent(event, options)
+  const connect = async (options = {}, protocol = {}) => {
+    runtime.start()
+    send({ type: Input.CONNECT, inputEnabled: true, outputEnabled: true, ...options }, {
+      descriptor: { type: 'test', instanceId: 'instance' }, capabilities: [],
+      ...protocol,
+    })
+    await until(() => runtime.status().state === 'connected')
+    return frontends.at(-1)
+  }
+  const request = objective => operations.submit({ objective }, { ownerId, sessionId })
+  t.after(async () => {
+    runtime.close()
+    await Promise.all(manager.list({ active: true }).map(task => operations.cancel(task.id, { ownerId })))
+  })
+  return { runtime, send, connect, request, manager, operations, events, frontends, runs, tasks, observations,
+    done, logs, memoryListeners, provider, conversationSync, ownerId, sessionId }
+}
+
+test('negotiated receipt-less audio keeps result notifications pending while tasks and conversation work', async t => {
+  const h = harness(t)
+  const f = await h.connect({}, { capabilitiesNegotiated: true, capabilities: ['input.audio', 'input.text'] })
+  h.send({ type: Input.TEXT_MESSAGE, text: 'hello' })
+  await until(() => f.inputs.length === 1)
+  f.emit({ type: 'response.created', response: { id: 'r' } })
+  f.emit({ type: 'response.audio.delta', response_id: 'r', delta: 'AAA=' })
+  f.emit({ type: 'response.audio_transcript.done', response_id: 'r', transcript: 'hello there' })
+  f.emit({ type: 'response.done', response: { id: 'r', status: 'completed' } })
+  assert.equal(h.events.find(e => e.type === 'transcript.final' && e.role === 'assistant').content, 'hello there')
+  const task = h.request('background work')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).resolve({ content: 'completed work' })
+  await h.manager.wait(task.id)
+  await tick()
+  assert.equal(h.manager.get(task.id).status, 'completed')
+  assert.equal(h.manager.get(task.id).notificationStatus, 'pending')
+  assert.equal(f.deliveries.some(d => d.origin === 'announcement'), false)
+  assert.ok(h.tasks.some(e => e.task?.id === task.id))
+  assert.ok(h.conversationSync.frontendContext({ ownerId: h.ownerId, sessionId: h.sessionId })
+    .some(message => message.content === 'hello there'))
+})
+
+test('negotiated text-only clients still receive and confirm task notifications without audio receipts', async t => {
+  const h = harness(t)
+  const f = await h.connect({ textOnly: true, inputEnabled: false }, {
+    capabilitiesNegotiated: true, capabilities: ['input.text'],
+  })
+  const task = h.request('text-only work')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).resolve({ content: 'text result' })
+  await h.manager.wait(task.id)
+  await until(() => f.deliveries.some(d => d.origin === 'announcement'))
+  const delivery = f.deliveries.find(d => d.origin === 'announcement')
+  f.emit({ type: 'response.created', response: { id: 'text-result' },
+    __voiceOrigin: delivery.origin, __voiceContext: delivery.context })
+  f.emit({ type: 'response.text.done', response_id: 'text-result', text: 'text result' })
+  f.emit({ type: 'response.done', response: { id: 'text-result', status: 'completed' } })
+  assert.equal(h.manager.get(task.id).notificationStatus, 'delivered')
+})
+
+test('invalid speech releases a completed task without another user turn', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  const task = h.request('diagnostic work')
+  await until(() => h.runs.has(task.id))
+  f.emit({ type: 'input_audio_buffer.speech_started', item_id: 'noise' })
+  f.emit({ type: 'input_audio_buffer.speech_stopped', item_id: 'noise', reason: 'turn_invalid' })
+  h.runs.get(task.id).resolve({ content: 'diagnostic result' })
+  await h.manager.wait(task.id)
+  assert.equal(h.events.findLast(e => e.type === 'voice.state').state, 'idle')
+  await until(() => f.deliveries.some(d => d.origin === 'announcement'))
+})
+
+test('a turn the reply watchdog gives up on no longer holds Gateway requests', async t => {
+  const h = harness(t)
+  h.provider.responseStartTimeoutMs = 20
+  const f = await h.connect()
+  const task = h.request('diagnostic work')
+  await until(() => h.runs.has(task.id))
+  f.emit({ type: 'input_audio_buffer.speech_started', item_id: 'unanswered' })
+  f.emit({ type: 'input_audio_buffer.speech_stopped', item_id: 'unanswered' })
+  await until(() => h.frontends.length === 2 && h.frontends[1].ready)
+  h.runs.get(task.id).resolve({ content: 'diagnostic result' })
+  await h.manager.wait(task.id)
+  await until(() => h.frontends[1].deliveries.some(d => d.origin === 'announcement'))
+})
+
+test('interruption clears old audio without requiring a client cancellation receipt', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  const task = h.request('diagnostic work')
+  await until(() => h.runs.has(task.id))
+  h.send({ type: Input.TEXT_MESSAGE, text: 'hello' })
+  await until(() => f.inputs.length === 1)
+  f.emit({ type: 'response.created', response: { id: 'old-audio' } })
+  f.emit({ type: 'response.audio.delta', response_id: 'old-audio', delta: 'AAA=', sampleRate: 24000 })
+  f.emit({ type: 'response.done', response: { id: 'old-audio', status: 'completed' } })
+  h.runs.get(task.id).resolve({ content: 'diagnostic result' })
+  await h.manager.wait(task.id)
+  // Generation completion is not playback completion: keep waiting normally.
+  await new Promise(resolve => setTimeout(resolve, 30))
+  assert.equal(f.deliveries.length, 0)
+  assert.equal(h.manager.get(task.id).notificationStatus, 'delivering')
+  h.send({ type: Input.INTERRUPT })
+  assert.equal(h.events.at(-1).type, 'playback.clear')
+  await until(() => f.deliveries.some(d => d.origin === 'announcement'))
+})
+
+for (const sourceDoneFirst of [false, true]) {
+  test(`tool output failure releases task delivery (source done first: ${sourceDoneFirst})`, async t => {
+    const h = harness(t)
+    const f = await h.connect()
+    let rejectOutput
+    f.sendFunctionOutput = () => new Promise((_resolve, reject) => { rejectOutput = reject })
+    h.send({ type: Input.TEXT_MESSAGE, text: 'run a background task' })
+    await until(() => f.inputs.length === 1)
+    f.emit({ type: 'response.created', response: { id: 'failed-tool-output' } })
+    f.emit({ type: 'response.function_call_arguments.done', response_id: 'failed-tool-output',
+      call_id: 'diagnostic-spawn', name: 'spawn_thinking', arguments: '{"objective":"diagnostic task"}' })
+    await until(() => rejectOutput)
+    const done = () => f.emit({ type: 'response.done', response: { id: 'failed-tool-output', status: 'completed' } })
+    if (sourceDoneFirst) done()
+    rejectOutput(new Error('tool output transport failure'))
+    await until(() => h.events.some(e => e.type === 'error' && e.message.includes('tool output transport failure')))
+    if (!sourceDoneFirst) done()
+    const task = h.manager.list({ active: true })[0]
+    await until(() => h.runs.has(task.id))
+    h.runs.get(task.id).resolve({ content: 'diagnostic completed result' })
+    await h.manager.wait(task.id)
+    await until(() => f.deliveries.some(d => d.origin === 'announcement'))
+  })
+}
+
+test('failure to request a tool continuation releases task delivery', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  f.ensureResponse = async () => { throw new Error('continuation transport failure') }
+  h.send({ type: Input.TEXT_MESSAGE, text: 'run a background task' })
+  await until(() => f.inputs.length === 1)
+  f.emit({ type: 'response.created', response: { id: 'failed-follow-up' } })
+  f.emit({ type: 'response.function_call_arguments.done', response_id: 'failed-follow-up',
+    call_id: 'spawn', name: 'spawn_thinking', arguments: '{"objective":"task"}' })
+  await until(() => f.outputs.length === 1)
+  f.emit({ type: 'response.done', response: { id: 'failed-follow-up', status: 'completed' } })
+  await until(() => h.events.some(e => e.type === 'error' && e.message === 'continuation transport failure'))
+  const task = h.manager.list({ active: true })[0]
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).resolve({ content: 'completed result' })
+  await h.manager.wait(task.id)
+  await until(() => f.deliveries.some(d => d.origin === 'announcement'))
+})
+
+test('an older tool output failure cannot release a newer user turn', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  let rejectOutput
+  f.sendFunctionOutput = () => new Promise((_resolve, reject) => { rejectOutput = reject })
+  h.send({ type: Input.TEXT_MESSAGE, text: 'run a background task' })
+  await until(() => f.inputs.length === 1)
+  f.emit({ type: 'response.created', response: { id: 'old-tool' } })
+  f.emit({ type: 'response.function_call_arguments.done', response_id: 'old-tool',
+    call_id: 'spawn', name: 'spawn_thinking', arguments: '{"objective":"task"}' })
+  await until(() => rejectOutput)
+  f.emit({ type: 'response.done', response: { id: 'old-tool', status: 'completed' } })
+  h.send({ type: Input.TEXT_MESSAGE, text: 'another question' })
+  await until(() => f.inputs.length === 2)
+  rejectOutput(new Error('old tool output failed'))
+  await until(() => h.events.some(e => e.type === 'error' && e.message === 'old tool output failed'))
+  const task = h.manager.list({ active: true })[0]
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).resolve({ content: 'completed result' })
+  await h.manager.wait(task.id)
+  await new Promise(resolve => setTimeout(resolve, 30))
+  assert.equal(f.deliveries.length, 0)
+  f.emit({ type: 'response.created', response: { id: 'new-reply' } })
+  f.emit({ type: 'response.done', response: { id: 'new-reply', status: 'completed' } })
+  await until(() => f.deliveries.some(d => d.origin === 'announcement'))
+})
+
+test('speech clears old audio and invalid speech does not leave task delivery blocked', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  const task = h.request('work')
+  await until(() => h.runs.has(task.id))
+  h.send({ type: Input.TEXT_MESSAGE, text: 'hello' })
+  await until(() => f.inputs.length === 1)
+  f.emit({ type: 'response.created', response: { id: 'old-audio' } })
+  f.emit({ type: 'response.audio.delta', response_id: 'old-audio', delta: 'AAA=', sampleRate: 24000 })
+  f.emit({ type: 'response.done', response: { id: 'old-audio', status: 'completed' } })
+  f.emit({ type: 'input_audio_buffer.speech_started', item_id: 'noise' })
+  h.runs.get(task.id).resolve({ content: 'completed result' })
+  await h.manager.wait(task.id)
+  await new Promise(resolve => setTimeout(resolve, 30))
+  assert.equal(f.deliveries.length, 0, 'speech must still block delivery')
+  f.emit({ type: 'input_audio_buffer.speech_stopped', item_id: 'noise', reason: 'turn_invalid' })
+  await until(() => f.deliveries.some(d => d.origin === 'announcement'))
+})
+
+test('frontend runtime chats without backend, socket, handshake or provider network', async t => {
+  const h = harness(t, { backend: false })
+  const f = await h.connect()
+  assert.equal(f.initialContext.frontend.backendConfigured, false)
+  h.send({ type: Input.TEXT_MESSAGE, text: 'hello' })
+  await until(() => f.inputs.length === 1)
+  f.emit({ type: 'response.created', response: { id: 'reply' } })
+  f.emit({ type: 'response.audio_transcript.done', response_id: 'reply', transcript: 'hello back' })
+  f.emit({ type: 'response.done', response: { id: 'reply', status: 'completed' } })
+  assert.ok(h.events.some(event => event.type === 'transcript.final' && event.content === 'hello back'))
+  assert.deepEqual(h.done, [{ id: 'reply', status: 'completed' }])
+  assert.equal(h.manager.list({}).length, 0)
+})
+
+test('DashScope early transcript cannot bind the next voice response to the previous turn', async t => {
+  const h = harness(t, { backend: false })
+  const session = await h.connect()
+  const { audioProvider, realtimeModel } = config
+  config.audioProvider = 'dashscope'
+  config.realtimeModel = DASHSCOPE_AUDIO_30_REALTIME_MODEL
+  t.after(() => Object.assign(config, { audioProvider, realtimeModel }))
+  const frontend = new RealtimeFrontend({
+    provider: REALTIME_PROVIDERS.dashscope,
+    onEvent: session.emit,
+  })
+  const receive = event => frontend.handleProviderEvent(event)
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+
+  receive({ type: 'input_audio_buffer.speech_started', item_id: 'previous-input' })
+  receive({ type: 'input_audio_buffer.speech_stopped', item_id: 'previous-input' })
+  receive({ type: 'response.created', response: { id: 'previous-response' } })
+  receive({ type: 'response.done', response: { id: 'previous-response', status: 'completed' } })
+  const previousTurn = h.events.findLast(event => event.type === 'turn.started').turnId
+
+  const responseId = 'next-response'
+  receive({ type: 'input_audio_buffer.speech_started', item_id: 'next-input' })
+  const nextTurn = h.events.findLast(event => event.type === 'turn.started').turnId
+  assert.notEqual(nextTurn, previousTurn)
+  receive({ type: 'response.audio_transcript.delta', response_id: responseId, delta: "'re" })
+  receive({ type: 'input_audio_buffer.speech_stopped', item_id: 'next-input' })
+  receive({ type: 'input_audio_buffer.committed', item_id: 'next-input' })
+  receive({ type: 'response.created', response: { id: responseId } })
+  receive({ type: 'response.audio_transcript.delta', response_id: responseId, delta: 'You' })
+  receive({ type: 'response.audio_transcript.delta', response_id: responseId, delta: "'re" })
+  receive({ type: 'response.audio.delta', response_id: responseId, delta: 'AA==' })
+  t.mock.timers.tick(12_000)
+
+  assert.deepEqual({
+    started: h.events.filter(event => event.type === 'response.started' && event.responseId === responseId)
+      .map(event => event.turnId),
+    audio: h.events.filter(event => event.type === 'audio.delta' && event.responseId === responseId)
+      .map(event => event.turnId),
+    timedOut: h.events.some(event => event.type === 'error' && /没有开始回复/.test(event.message)),
+  }, { started: [nextTurn], audio: [nextTurn], timedOut: false })
+})
+
+test('DashScope late final transcript keeps its completed turn without reopening the response slot', async t => {
+  const h = harness(t, { backend: false })
+  const session = await h.connect({}, {
+    capabilitiesNegotiated: true, capabilities: ['input.audio', 'input.text'],
+  })
+  const { audioProvider, realtimeModel } = config
+  config.audioProvider = 'dashscope'
+  config.realtimeModel = DASHSCOPE_AUDIO_30_REALTIME_MODEL
+  t.after(() => Object.assign(config, { audioProvider, realtimeModel }))
+  const frontend = new RealtimeFrontend({
+    provider: REALTIME_PROVIDERS.dashscope,
+    onEvent: session.emit,
+  })
+  t.after(() => frontend.close())
+  const receive = event => frontend.handleProviderEvent(event)
+
+  receive({ type: 'input_audio_buffer.speech_started', item_id: 'first-input' })
+  receive({ type: 'input_audio_buffer.speech_stopped', item_id: 'first-input' })
+  receive({ type: 'response.created', response: { id: 'first-response' } })
+  receive({ type: 'response.audio.delta', response_id: 'first-response', delta: 'AA==' })
+  receive({ type: 'response.done', response: { id: 'first-response', status: 'completed' } })
+  const firstTurn = h.events.findLast(event => event.type === 'turn.started').turnId
+  assert.equal(frontend.activeResponses.size, 0)
+
+  receive({ type: 'input_audio_buffer.speech_started', item_id: 'next-input' })
+  receive({ type: 'input_audio_buffer.speech_stopped', item_id: 'next-input' })
+  const nextTurn = h.events.findLast(event => event.type === 'turn.started').turnId
+  assert.notEqual(nextTurn, firstTurn)
+  frontend.responseSlot.occupy()
+  const startedBeforeFinal = h.events.filter(event => event.type === 'response.started').length
+  receive({
+    type: 'response.audio_transcript.done', response_id: 'first-response', transcript: 'first answer',
+  })
+
+  const final = h.events.findLast(event => event.type === 'transcript.final' && event.role === 'assistant')
+  assert.equal(final?.content, 'first answer')
+  assert.equal(final.turnId, firstTurn)
+  assert.equal(h.events.filter(event => event.type === 'response.started').length, startedBeforeFinal)
+  assert.equal(frontend.activeResponses.size, 0, 'a final transcript must not resurrect the completed response')
+  assert.equal(frontend.responseSlot.phase, 'pending', 'the next response still owns the pending slot')
+  assert.ok(h.conversationSync.frontendContext(h)
+    .some(message => message.role === 'assistant' && message.content === 'first answer' && message.turnId === firstTurn))
+  assert.deepEqual(h.done, [{ id: 'first-response', status: 'completed' }])
+
+  receive({ type: 'response.created', response: { id: 'next-response' } })
+  assert.equal(frontend.responseSlot.phase, 'idle')
+  assert.deepEqual([...frontend.activeResponses], ['next-response'])
+  receive({ type: 'response.done', response: { id: 'next-response', status: 'completed' } })
+})
+
+for (const hadAudio of [false, true]) {
+  test(`DashScope final text cannot recreate a cleaned response context (had audio: ${hadAudio})`, async t => {
+    const h = harness(t, { backend: false })
+    const session = await h.connect({}, {
+      capabilitiesNegotiated: true, capabilities: ['input.audio', 'input.text'],
+    })
+    const { audioProvider, realtimeModel } = config
+    config.audioProvider = 'dashscope'
+    config.realtimeModel = DASHSCOPE_AUDIO_30_REALTIME_MODEL
+    t.after(() => Object.assign(config, { audioProvider, realtimeModel }))
+    const frontend = new RealtimeFrontend({
+      provider: REALTIME_PROVIDERS.dashscope,
+      onEvent: session.emit,
+    })
+    t.after(() => frontend.close())
+    const receive = event => frontend.handleProviderEvent(event)
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+
+    receive({ type: 'input_audio_buffer.speech_started', item_id: 'old-input' })
+    receive({ type: 'input_audio_buffer.speech_stopped', item_id: 'old-input' })
+    receive({ type: 'response.created', response: { id: 'old-response' } })
+    if (hadAudio) receive({ type: 'response.audio.delta', response_id: 'old-response', delta: 'AA==' })
+    receive({ type: 'response.done', response: { id: 'old-response', status: 'completed' } })
+    // Silent replies are cleaned immediately; receipt-less audio retains its
+    // original turn for final text only until the context cleanup deadline.
+    if (hadAudio) t.mock.timers.tick(30_000)
+
+    receive({ type: 'input_audio_buffer.speech_started', item_id: 'new-input' })
+    receive({ type: 'input_audio_buffer.speech_stopped', item_id: 'new-input' })
+    receive({ type: 'response.created', response: { id: 'new-response' } })
+    const eventsBeforeFinal = h.events.length
+    const delivered = receive({
+      type: 'response.audio_transcript.done', response_id: 'old-response', transcript: 'too late',
+    })
+
+    assert.equal(delivered.length, 1, 'the provider forwards the late final for the Gateway to correlate')
+    assert.equal(h.events.length, eventsBeforeFinal, 'an expired response must not emit new turn or transcript events')
+    assert.deepEqual([...frontend.activeResponses], ['new-response'])
+    assert.equal(h.conversationSync.frontendContext(h).some(message => message.content === 'too late'), false)
+    receive({ type: 'response.done', response: { id: 'new-response', status: 'completed' } })
+  })
+}
+
+test('spawn receipt is asynchronous; ongoing work does not prevent further chat, interruption or close', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  h.send({ type: Input.TEXT_MESSAGE, text: 'read memory' })
+  await until(() => f.inputs.length === 1)
+  f.emit({ type: 'response.created', response: { id: 'spawn-response' } })
+  f.emit({ type: 'response.function_call_arguments.done', response_id: 'spawn-response',
+    call_id: 'spawn-call', name: 'spawn_thinking', arguments: '{"objective":"read memory"}' })
+  await until(() => f.outputs.length === 1)
+  const receipt = f.outputs[0].result
+  assert.equal(receipt.status, 'accepted')
+  assert.match(receipt.task_id, /^task_\d+$/u)
+  await until(() => h.runs.has(receipt.task_id))
+  f.emit({ type: 'response.done', response: { id: 'spawn-response', status: 'completed' } })
+  h.send({ type: Input.TEXT_MESSAGE, text: 'how are you?' })
+  await until(() => f.inputs.length === 2)
+  h.send({ type: Input.INTERRUPT })
+  h.runtime.close()
+  assert.equal(h.manager.get(receipt.task_id).status, 'running')
+  assert.equal(h.runs.get(receipt.task_id).signal.aborted, false)
+  const sent = h.events.length
+  f.emit({ type: 'response.function_call_arguments.done', call_id: 'late', name: 'spawn_thinking', arguments: '{"objective":"late"}' })
+  h.runs.get(receipt.task_id).resolve({ content: '24 GB' })
+  await h.manager.wait(receipt.task_id)
+  await tick()
+  assert.equal(h.manager.list({}).length, 1, 'late provider events cannot create work after close')
+  assert.equal(h.manager.get(receipt.task_id).notificationStatus, 'pending')
+  assert.equal(h.events.length, sent)
+})
+
+test('microphone mute and host suspension do not close the model or cancel work', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  const task = h.request('work')
+  await until(() => h.runs.has(task.id))
+  h.send({ type: Input.AUDIO_APPEND, audio: 'first' })
+  h.send({ type: Input.INPUT_MUTE })
+  h.send({ type: Input.AUDIO_APPEND, audio: 'muted' })
+  h.send({ type: Input.INPUT_UNMUTE })
+  h.runtime.applyInputSuspension({ suspended: true, owner: 'recorder' })
+  h.send({ type: Input.AUDIO_APPEND, audio: 'suspended' })
+  h.runtime.applyInputSuspension({ suspended: false })
+  h.send({ type: Input.AUDIO_APPEND, audio: 'resumed' })
+  assert.deepEqual(f.audio, ['first', 'resumed'])
+  assert.equal(f.ready, true)
+  assert.equal(h.manager.get(task.id).status, 'running')
+  h.operations.cancel(task.id, { ownerId: h.ownerId })
+  await h.manager.wait(task.id)
+  assert.equal(h.manager.get(task.id).status, 'cancelled', 'only explicit Task cancellation stops work')
+})
+
+test('image buffering does not infer client state; only explicit environment events update context', async t => {
+  const h = harness(t)
+  const f = await h.connect({ inputEnabled: false })
+  const frame = { type: Input.IMAGE_APPEND, image: Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64') }
+  h.send({ type: Input.IMAGE_APPEND, image: 'invalid-frame' })
+  await tick()
+  assert.equal(f.deliveries.length, 0, 'invalid frames must not announce active vision')
+  h.send(frame)
+  await tick()
+  assert.equal(f.images.length, 1)
+  assert.equal(f.audio.length, 0)
+  assert.equal(f.deliveries.length, 0, 'a frame is not an environment state event')
+  const router = new GatewayEventRouter()
+  const publish = async state => {
+    const result = await router.publish({
+      event_id: `visual-${state}`, text: state === 'active' ? '已开启实时视觉输入' : '已停止实时视觉输入，当前无法看到新的画面',
+    })
+    h.runtime.handleClientDelivery(result)
+    await tick()
+  }
+  await publish('active')
+  assert.match(f.deliveries[0].text, /已开启实时视觉输入/)
+  h.send({ type: Input.INPUT_MUTE })
+  await tick()
+  assert.equal(f.deliveries.length, 1, 'muting audio must not stop vision')
+  h.send({ type: Input.IMAGE_CLEAR })
+  h.send({ type: Input.IMAGE_CLEAR })
+  await tick()
+  assert.equal(f.deliveries.length, 1, 'clearing a buffer must not report camera shutdown')
+  await publish('inactive')
+  assert.equal(f.deliveries.length, 2)
+  assert.match(f.deliveries[1].text, /已停止实时视觉输入/)
+  assert.ok(f.deliveries.every(value => value.settings.route === 'context'))
+  assert.equal(f.cancels, 0)
+  h.send(frame)
+  await tick()
+  assert.equal(f.images.length, 2)
+  assert.equal(f.deliveries.length, 2, 'new frames do not substitute for explicit state changes')
+  h.runtime.applyInputSuspension({ suspended: true, owner: 'test' })
+  h.send(frame)
+  await tick()
+  assert.equal(f.images.length, 2, 'host suspension still gates camera frames')
+  assert.equal(f.deliveries.length, 2)
+})
+
+test('a tool continuation ending without a response releases the permission announcement window', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  f.emit({ type: 'input_audio_buffer.speech_started', item_id: 'input-pending' })
+  f.emit({ type: 'input_audio_buffer.speech_stopped', item_id: 'input-pending' })
+  const turnId = h.events.findLast(event => event.type === 'turn.started').turnId
+  const task = h.request('read file')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).onEvent({ type: 'backend.permission.requested', permission: {
+    id: 'auth-pending', status: 'pending', summary: 'read a file',
+  } })
+  await tick()
+  assert.equal(f.deliveries.some(delivery => delivery.origin === 'permission'), false)
+  f.settle({ origin: 'agent', context: { turnId }, outcome: { timedOut: true, phase: 'start' } })
+  await until(() => f.deliveries.some(delivery => delivery.origin === 'permission'))
+})
+
+test('pending permission tool exposure and input-busy retry use the production coordinator', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  const task = h.request('read file')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).onEvent({ type: 'backend.permission.requested', permission: {
+    id: 'auth_1', status: 'pending', summary: 'read a file',
+  } })
+  await until(() => f.deliveries.some(delivery => delivery.origin === 'permission'))
+  assert.ok(f.updates.at(-1).context.frontend.capabilities.includes('permission.respond'))
+  assert.doesNotThrow(() => f.emit({ type: 'error', __voiceOrigin: 'permission', error: { message: 'input busy' } }))
+  assert.equal(h.manager.get(task.id).authorization.status, 'pending')
+  assert.ok(!h.events.some(event => event.type === 'error'))
+  h.runs.get(task.id).onEvent({ type: 'backend.permission.resolved', permission: { id: 'auth_1', status: 'approved' } })
+  assert.equal(h.manager.get(task.id).authorization, null)
+})
+
+// A real frontend on a fake socket, so shouldCreate is checked as in production.
+function wiredFrontend(t) {
+  const sent = []
+  const frontend = new RealtimeFrontend({ provider: REALTIME_PROVIDERS.dashscope, onDiagnostic() {} })
+  frontend.ready = true
+  frontend.ws = { readyState: 1, send: raw => sent.push(JSON.parse(raw)) }
+  t.after(() => frontend.resetResponses())
+  return { frontend, creates: () => sent.filter(event => event.type === 'response.create').length }
+}
+
+// The user answers a pending permission by voice; returns the runtime's
+// fallback request once it fires.
+async function spokenPermissionAnswer(t) {
+  const h = harness(t)
+  const f = await h.connect()
+  const requested = []
+  f.ensureResponse = async (context, options) => { requested.push({ context, options }) }
+  const task = h.request('write a file')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).onEvent({ type: 'backend.permission.requested', permission: {
+    id: 'auth_spoken', status: 'pending', summary: 'write a file',
+  } })
+  await until(() => f.deliveries.some(delivery => delivery.origin === 'permission'))
+  f.emit({ type: 'input_audio_buffer.speech_started', item_id: 'answer' })
+  f.emit({ type: 'input_audio_buffer.speech_stopped', item_id: 'answer' })
+  f.emit({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'answer', transcript: '同意' })
+  await until(() => requested.length === 1)
+  return { h, f, task, request: requested[0] }
+}
+
+test('a spoken permission answer without an automatic reply sends one response.create', async t => {
+  const { h, task, request } = await spokenPermissionAnswer(t)
+  const wired = wiredFrontend(t)
+  wired.frontend.ensureResponse(request.context, request.options).catch(() => {})
+  await until(() => wired.creates() > 0)
+  await tick()
+  assert.equal(wired.creates(), 1)
+  assert.equal(h.manager.get(task.id).authorization.status, 'pending')
+})
+
+test('an automatic reply that starts before the fallback is sent takes over its turn', async t => {
+  const { f, request } = await spokenPermissionAnswer(t)
+  f.emit({ type: 'response.created', response: { id: 'automatic' } })
+  const wired = wiredFrontend(t)
+  assert.equal((await wired.frontend.ensureResponse(request.context, request.options)).skipped, true)
+  assert.equal(wired.creates(), 0)
+})
+
+test('the pending-permission gate decides once and skips a stale or refused request', async t => {
+  const gate = state => permissionResponseGate({
+    isCandidate: () => state.candidate,
+    hasPendingPermission: () => state.pending,
+    claim: () => { state.candidate = false; state.claims += 1 },
+  })
+  // Still pending at the pre-send re-check: one request goes out and stays
+  // wanted once the backend has settled the permission.
+  const open = { candidate: true, pending: true, claims: 0 }
+  const a = wiredFrontend(t)
+  const shouldCreate = gate(open)
+  a.frontend.ensureResponse({ turnId: 'turn-1' }, { shouldCreate }).catch(() => {})
+  await until(() => a.creates() === 1)
+  assert.equal(open.claims, 1)
+  open.pending = false
+  assert.equal(shouldCreate(), true)
+  // Settled while the frontend waited for an active response: nothing is sent
+  // and the turn is never claimed.
+  const settled = { candidate: true, pending: true, claims: 0 }
+  const b = wiredFrontend(t)
+  b.frontend.handleLifecycle({ type: 'response.created', response: { id: 'busy' } })
+  const skipped = b.frontend.ensureResponse({ turnId: 'turn-1' }, { shouldCreate: gate(settled) })
+  await tick()
+  settled.pending = false
+  b.frontend.handleLifecycle({ type: 'response.done', response: { id: 'busy', status: 'completed' } })
+  assert.equal((await skipped).skipped, true)
+  assert.equal(b.creates(), 0)
+  assert.equal(settled.claims, 0)
+  // Refused as busy because the model answered on its own: once that reply has
+  // settled the permission, the retry is dropped instead of asking again.
+  const raced = { candidate: true, pending: true, claims: 0 }
+  const c = wiredFrontend(t)
+  const retried = c.frontend.ensureResponse({ turnId: 'turn-1' }, { shouldCreate: gate(raced) })
+  await until(() => c.creates() === 1)
+  c.frontend.handleLifecycle({ type: 'response.created', response: { id: 'auto-1' } })
+  c.frontend.handleLifecycle({ type: 'error', error: { type: 'invalid_request_error', message: 'Conversation already has an active response' } })
+  raced.pending = false
+  c.frontend.handleLifecycle({ type: 'response.done', response: { id: 'auto-1', status: 'completed' } })
+  // A second request would wait for its own response.created; fail fast instead.
+  const outcome = await Promise.race([retried, new Promise(resolve => setTimeout(resolve, 500, 'resent'))])
+  assert.equal(outcome.skipped, true)
+  assert.equal(c.creates(), 1)
+})
+
+test('a transport reconnect restores an unresolved permission without restarting backend work', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  const task = h.request('read memory')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).onEvent({ type: 'backend.permission.requested', permission: {
+    id: 'auth-reconnect', status: 'pending', summary: 'read memory',
+  } })
+  await until(() => f.deliveries.some(delivery => delivery.origin === 'permission'))
+  const old = f.deliveries.find(delivery => delivery.origin === 'permission')
+  f.disconnect()
+  assert.equal(old.settings.shouldRespond(), false)
+  await until(() => h.frontends.length === 2 && h.frontends[1].deliveries.some(delivery => delivery.origin === 'permission'))
+  assert.ok(h.frontends[1].initialContext.frontend.capabilities.includes('permission.respond'))
+  assert.equal(h.manager.get(task.id).authorization.status, 'pending')
+  assert.equal(h.runs.size, 1)
+})
+
+test('deactivation receives only holder metadata and stops frontend activity, not backend work', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  const task = h.request('keep working')
+  await until(() => h.runs.has(task.id))
+  const holder = { type: 'mobile', instanceId: 'replacement' }
+  h.runtime.deactivate(holder)
+  assert.equal(f.ready, false)
+  assert.equal(h.runtime.status().state, 'disconnected')
+  assert.deepEqual(h.events.find(event => event.type === 'voice.deactivated').holder, holder)
+  h.send({ type: Input.AUDIO_APPEND, audio: 'inactive' })
+  assert.deepEqual(f.audio, [])
+  assert.equal(h.runs.get(task.id).signal.aborted, false)
+  h.runtime.close()
+  assert.equal(h.manager.get(task.id).status, 'running')
+})
+
+test('runtime-owned context/profile/voice updates stay isolated across connections', async t => {
+  const h = harness(t), other = harness(t)
+  const f = await h.connect(), otherFrontend = await other.connect()
+  h.runtime.setAssistantProfile('brief answers')
+  assert.equal(f.updates.at(-1).context.assistantProfile, 'brief answers')
+  assert.equal(otherFrontend.updates.length, 0)
+  for (const listener of h.memoryListeners) listener({ ownerId: h.ownerId, sessionId: 'other', source: 'client' })
+  assert.equal(f.updates.at(-1).settings.refreshSession, true)
+  const voice = h.runtime.updateOutputVoice('new-voice')
+  assert.equal(voice.reconnecting, true)
+  await until(() => h.frontends.length === 2 && h.runtime.status().state === 'connected')
+  assert.equal(h.frontends[1].sessionOptions.voice, 'new-voice')
+  assert.equal(h.frontends[1].initialContext.assistantProfile, 'brief answers')
+  assert.equal(other.frontends.length, 1)
+  h.runtime.close()
+  h.runtime.close()
+  assert.equal(h.memoryListeners.size, 0)
+  assert.equal(h.observations.filter(event => event.closed).length, 1)
+  assert.equal(otherFrontend.ready, true)
+})
+
+test('client sleep actions retain the model session and wake without rebuilding it', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  h.send({ type: Input.CONNECT, inputEnabled: true, outputEnabled: true }, {
+    descriptor: { type: 'desktop', instanceId: 'desktop' },
+    capabilities: [clientActionCapabilities()[ClientActionName.ENTER_SLEEP]],
+  })
+  await tick()
+  h.send({ type: Input.SLEEP })
+  await until(() => h.events.some(event => event.type === 'client.action.request'))
+  const action = h.events.find(event => event.type === 'client.action.request')
+  assert.equal(h.runtime.receiveActionResult({ type: 'client.action.result', event_id: 'sleep-done',
+    request_event_id: action.event_id, name: action.name, status: 'completed', output: {} }), true)
+  await until(() => h.runtime.status().state === 'sleeping')
+  assert.equal(f.ready, true)
+  h.send({ type: Input.AUDIO_APPEND, audio: 'asleep' })
+  assert.equal(f.audio.length, 0)
+  h.send({ type: Input.WAKE })
+  assert.equal(h.runtime.status().state, 'connected')
+  assert.equal(h.frontends.length, 1)
+})
+
+test('client-owned sleep tool forwards once, records success silently, and presence gates input independently', async t => {
+  const h = harness(t)
+  h.runtime.start()
+  h.send({ type: Input.CONNECT, inputEnabled: true, outputEnabled: true, clientTools: desktopClientTools }, {
+    descriptor: { type: 'desktop', instanceId: 'desktop' }, capabilities: ['client.tools', 'client.presence'],
+  })
+  await until(() => h.frontends.length === 1 && h.runtime.status().state === 'connected')
+  const f = h.frontends[0]
+  assert.equal(f.initialContext.frontend.tools[0].function.name, 'enter_sleep')
+  h.send({ type: Input.TEXT_MESSAGE, text: '请休息' })
+  await until(() => f.inputs.length === 1)
+  f.emit({ type: 'response.created', response: { id: 'sleep-response' } })
+  f.emit({ type: 'response.function_call_arguments.done', response_id: 'sleep-response',
+    call_id: 'sleep-call', name: 'enter_sleep', arguments: '{}' })
+  await until(() => h.events.some(event => event.type === 'client.action.request'))
+  const action = h.events.find(event => event.type === 'client.action.request')
+  assert.equal(action.name, 'client.tool.enter_sleep')
+  assert.equal(h.runtime.status().state, 'connected', 'a request is not a successful operation')
+  h.runtime.receiveActionResult({ type: 'client.action.result', event_id: 'sleep-result',
+    request_event_id: action.event_id, status: 'completed', output: { state: 'hidden' } })
+  await until(() => f.outputs.length === 1)
+  assert.equal(f.outputs[0].settings.createResponse, false)
+  h.runtime.updateClientPresence('sleeping')
+  assert.equal(h.runtime.status().state, 'sleeping')
+  h.send({ type: Input.AUDIO_APPEND, audio: 'asleep' })
+  assert.deepEqual(f.audio, [])
+  assert.equal(f.ready, true)
+  const notice = await new GatewayEventRouter().publish({ event_id: 'sleep-info', text: '客户端已休眠。' })
+  h.runtime.handleClientDelivery(notice)
+  await tick()
+  assert.match(f.deliveries.at(-1).text, /客户端已休眠/)
+  h.runtime.updateClientPresence('active')
+  assert.equal(h.runtime.status().state, 'connected')
+  assert.equal(h.frontends.length, 1)
+  assert.equal(h.events.filter(event => event.type === 'client.action.request').length, 1)
+})
+
+test('closing before tool discovery or inactivity timeout cannot start a new model or action', async t => {
+  let ready
+  const h = harness(t, { frontendToolSourcesReady: new Promise(resolve => { ready = resolve }) })
+  h.runtime.start()
+  h.send({ type: Input.CONNECT, outputEnabled: true })
+  h.runtime.handleClientDelivery({ name: 'desktop.presence.sleep_requested' })
+  h.runtime.close()
+  ready()
+  const count = h.events.length
+  await new Promise(resolve => setTimeout(resolve, 120))
+  assert.equal(h.frontends.length, 0)
+  assert.equal(h.events.length, count)
+})
+
+test('normal transport closure is informational while abnormal closure keeps warning details', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  for (const [code, level] of [[1000, 'info'], [1005, 'warn'], [1006, 'warn'], [1011, 'warn']]) {
+    const fields = { provider: 'test', code, reason: 'synthetic close reason' }
+    f.diagnose({ event: 'realtime.transport_closed', ...fields })
+    assert.deepEqual(h.logs.at(-1), { level, event: 'realtime.transport_closed', fields })
+  }
+  f.diagnose({ event: 'realtime.response_timeout', provider: 'test', phase: 'inactivity' })
+  assert.equal(h.logs.at(-1).level, 'warn', 'other diagnostic warnings must not be downgraded')
+  assert.equal(h.events.some(event => event.type === 'error'), false, 'logging alone must not change client state')
+  assert.equal(h.runtime.status().state, 'connected')
+})
+
+test('failed response completion exposes nested provider errors and preserves their diagnostic details', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  const error = { code: 'model_inference_error', type: 'server_error', message: 'Synthetic model inference failure' }
+  f.emit({ type: 'response.created', response: { id: 'failed-response' } })
+  f.emit({ type: 'response.done', response: {
+    id: 'failed-response', status: 'failed', status_details: { type: 'failed', error },
+  } })
+  const errors = h.events.filter(event => event.type === 'error')
+  assert.equal(errors.length, 1, 'a failed completion must not be silently presented as an idle response')
+  assert.ok(errors[0].message.includes(error.code))
+  assert.ok(errors[0].message.includes(error.message))
+  const failureLog = h.logs.find(log => log.event === 'realtime.response.failed')
+  assert.ok(failureLog, 'provider response failures must remain available in logs')
+  assert.equal(failureLog.fields.responseId, 'failed-response')
+  assert.equal(failureLog.fields.provider, 'test')
+  assert.ok(failureLog.fields.errorMessage.includes(error.code))
+  assert.ok(failureLog.fields.errorMessage.includes(error.type))
+  assert.ok(failureLog.fields.errorMessage.includes(error.message))
+  assert.deepEqual(h.done, [{ id: 'failed-response', status: 'failed' }])
+  assert.equal(h.runtime.status().state, 'connected', 'a nonfatal response error does not block the session')
+})
+
+test('failed response completion without provider details still reports an error', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  f.emit({ type: 'response.created', response: { id: 'undetailed-failure' } })
+  f.emit({ type: 'response.done', response: { id: 'undetailed-failure', status: 'failed' } })
+  const errors = h.events.filter(event => event.type === 'error')
+  assert.equal(errors.length, 1)
+  assert.ok(errors[0].message.trim())
+  assert.deepEqual(h.done, [{ id: 'undetailed-failure', status: 'failed' }])
+})
+
+test('fatal errors in failed response completions block later close and audio reconnects', async t => {
+  const h = harness(t)
+  const error = { code: 'Model.AccessDenied', message: 'Synthetic model access denial' }
+  h.provider.classifyError = message => message.includes(error.code) ? 'fatal' : 'other'
+  const f = await h.connect()
+  f.emit({ type: 'response.created', response: { id: 'fatal-response' } })
+  f.emit({ type: 'response.done', response: {
+    id: 'fatal-response', status: 'failed', status_details: { type: 'failed', error },
+  } })
+  assert.equal(h.runtime.status().state, 'unavailable')
+  assert.equal(f.ready, false)
+  const unavailable = h.events.findLast(event => event.type === 'voice.connection' && event.state === 'unavailable')
+  assert.ok(unavailable.message.includes(error.code))
+  assert.ok(unavailable.message.includes(error.message))
+  assert.ok(h.logs.some(log => log.event === 'realtime.blocked' && log.fields.classification === 'fatal'))
+  f.disconnect()
+  h.send({ type: Input.AUDIO_APPEND, audio: 'AAAA' })
+  await new Promise(resolve => setTimeout(resolve, 600))
+  assert.equal(h.frontends.length, 1, 'the provider close following a fatal failure must not start a reconnect loop')
+  assert.equal(h.runtime.status().state, 'unavailable')
+})
+
+for (const status of ['cancelled', 'completed']) {
+  test(`${status} response completion does not report a nested error or block the session`, async t => {
+    const h = harness(t)
+    h.provider.classifyError = () => 'fatal'
+    const f = await h.connect()
+    f.emit({ type: 'response.created', response: { id: `${status}-response` } })
+    f.emit({ type: 'response.done', response: {
+      id: `${status}-response`, status,
+      status_details: { error: { code: 'synthetic_detail', message: 'Not a failed response' } },
+    } })
+    assert.equal(h.events.some(event => event.type === 'error'), false)
+    assert.equal(h.logs.some(log => log.event === 'realtime.blocked'), false)
+    assert.equal(h.runtime.status().state, 'connected')
+    assert.deepEqual(h.done, [{ id: `${status}-response`, status }])
+  })
+}
+
+test('a failed suppressed response does not surface an error or block a newer turn', async t => {
+  const h = harness(t)
+  h.provider.classifyError = () => 'fatal'
+  const f = await h.connect()
+  h.send({ type: Input.TEXT_MESSAGE, text: 'old question' })
+  await until(() => f.inputs.length === 1)
+  f.emit({ type: 'response.created', response: { id: 'old-response' } })
+  f.emit({ type: 'response.audio.delta', response_id: 'old-response', delta: 'AAA=' })
+  h.send({ type: Input.INTERRUPT })
+  h.send({ type: Input.TEXT_MESSAGE, text: 'new question' })
+  await until(() => f.inputs.length === 2)
+  f.emit({ type: 'response.created', response: { id: 'new-response' } })
+  f.emit({ type: 'response.done', response: {
+    id: 'old-response', status: 'failed',
+    status_details: { error: { code: 'Model.AccessDenied', message: 'Synthetic old response error' } },
+  } })
+  assert.equal(h.events.some(event => event.type === 'error'), false)
+  assert.equal(h.logs.some(log => log.event === 'realtime.blocked'), false)
+  assert.equal(h.runtime.status().state, 'connected')
+  assert.ok(h.logs.some(log => log.event === 'realtime.response.done'
+    && log.fields.responseId === 'old-response' && log.fields.suppressed === true))
+  f.emit({ type: 'response.text.done', response_id: 'new-response', text: 'new answer' })
+  f.emit({ type: 'response.done', response: { id: 'new-response', status: 'completed' } })
+  assert.ok(h.events.some(event => event.type === 'transcript.final' && event.content === 'new answer'))
+})
+
+test('failed response content-safety recovery keeps the failed turn after response cleanup', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  h.send({ type: Input.TEXT_MESSAGE, text: 'rejected question' })
+  await until(() => f.inputs.length === 1)
+  const rejectedTurn = f.inputs[0].context.turnId
+  f.emit({ type: 'response.created', response: { id: 'rejected-response' } })
+  // No audio has played, so this older response has not been suppressed by
+  // playback cancellation. Its own turn, not the current one, must be excluded.
+  h.send({ type: Input.TEXT_MESSAGE, text: 'keep this question' })
+  await until(() => f.inputs.length === 2)
+  const currentTurn = f.inputs[1].context.turnId
+  assert.notEqual(rejectedTurn, currentTurn)
+  f.emit({ type: 'response.done', response: {
+    id: 'rejected-response', status: 'failed', status_details: { error: { message: 'unsafe' } },
+  } })
+  await until(() => h.frontends.length === 2 && h.frontends[1].deliveries.length > 0)
+  const recoveryLog = h.logs.find(log => log.event === 'realtime.content_safety_recovery')
+  assert.equal(recoveryLog.fields.excludedTurnId, rejectedTurn)
+  const restored = h.frontends[1].initialContext.recentMessages
+  assert.equal(restored.some(message => message.turnId === rejectedTurn), false)
+  assert.ok(restored.some(message => message.turnId === currentTurn && message.content === 'keep this question'))
+  assert.ok(h.conversationSync.frontendContext(h).some(message => message.turnId === rejectedTurn),
+    'recovery must not delete the visible conversation history')
+  assert.deepEqual(h.done, [{ id: 'rejected-response', status: 'failed' }])
+})
+
+test('content-safety reconnect recovers frontend context without rerunning backend work', async t => {
+  const h = harness(t)
+  const f = await h.connect()
+  const task = h.request('continue working')
+  await until(() => h.runs.has(task.id))
+  f.emit({ type: 'error', error: { message: 'unsafe' } })
+  assert.equal(h.events.some(event => event.message?.includes('已自动恢复')), false)
+  await until(() => h.frontends.length === 2 && h.frontends[1].deliveries.length > 0)
+  assert.equal(h.runs.size, 1)
+  assert.equal(h.manager.get(task.id).status, 'running')
+  assert.ok(h.events.some(event => event.reason === 'provider_content_safety'))
+  assert.ok(h.events.some(event => event.message?.includes('已自动恢复')))
+})
+
+test('rejected restoration quarantines only replay context and stops repeated reconnects', async t => {
+  const h = harness(t)
+  h.conversationSync.restore({ ownerId: h.ownerId, sessionId: h.sessionId, messages: [
+    { id: 'u1', role: 'user', source: 'text-user', content: 'previous question' },
+    { id: 'a1', role: 'assistant', source: 'realtime-direct', content: 'previous answer' },
+  ] })
+  const first = await h.connect()
+  assert.equal(first.initialContext.recentMessages.length, 2)
+  first.emit({ type: 'error', __voiceOrigin: 'restore', error: { message: 'unsafe' } })
+  await until(() => h.frontends.length === 2)
+  assert.deepEqual(h.frontends[1].initialContext.recentMessages, [])
+  assert.equal(h.conversationSync.frontendContext(h).length, 2)
+  h.frontends[1].emit({ type: 'error', error: { message: 'unsafe' } })
+  await until(() => h.frontends.length === 3)
+  h.frontends[2].emit({ type: 'error', error: { message: 'unsafe' } })
+  assert.equal(h.runtime.status().state, 'unavailable')
+  // Even incoming microphone data and late errors cannot reopen a blocked session.
+  first.emit({ type: 'error', error: { message: 'unsafe' } })
+  h.send({ type: Input.AUDIO_APPEND, audio: 'AAAA' })
+  await new Promise(resolve => setTimeout(resolve, 600))
+  assert.equal(h.frontends.length, 3)
+  assert.ok(h.events.some(e => e.message?.includes('自动恢复已停止')))
+})
+
+for (const completesAfterClose of [true, false]) {
+  test(`new session does not announce previous session results (completes after close: ${completesAfterClose})`, async t => {
+    const a = harness(t, { ownerId: 'user_personal', sessionId: 'call-A' })
+    const frontendA = await a.connect()
+    const task = a.request('private task for A')
+    await until(() => a.runs.has(task.id))
+    if (completesAfterClose) a.runtime.close()
+    a.runs.get(task.id).resolve({ content: 'private result for A' })
+    await a.manager.wait(task.id)
+    if (!completesAfterClose) {
+      await until(() => frontendA.deliveries.some(delivery => delivery.origin === 'announcement'))
+      assert.equal(a.manager.get(task.id).notificationStatus, 'delivering')
+      a.runtime.close()
+    }
+    assert.equal(a.manager.get(task.id).notificationStatus, 'pending')
+    const b = harness(t, { ownerId: 'user_personal', sessionId: 'call-B', taskManager: a.manager })
+    const frontendB = await b.connect()
+    // Allow the zero-delay announcement batch timer to run if onReady claimed it.
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(frontendB.deliveries.length, 0)
+    assert.equal(a.manager.get(task.id).notificationStatus, 'pending')
+    b.runtime.close()
+    const resumed = harness(t, { ownerId: 'user_personal', sessionId: 'call-A', taskManager: a.manager })
+    const frontendResumed = await resumed.connect()
+    await until(() => frontendResumed.deliveries.some(delivery => delivery.origin === 'announcement'))
+    assert.match(frontendResumed.deliveries[0].text, /private result for A/u)
+  })
+}
+
+test('input state separates client mute, host suspension and deactivation', async t => {
+  const h = harness(t, { backend: false })
+  await h.connect()
+  assert.deepEqual(h.runtime.inputState(), { inputEnabled: true, inputSuspended: false, inputActive: true })
+  h.send({ type: Input.INPUT_MUTE })
+  assert.deepEqual(h.runtime.inputState(), { inputEnabled: false, inputSuspended: false, inputActive: false })
+  h.runtime.applyInputSuspension({ suspended: true, owner: 'host', reason: 'test' })
+  assert.deepEqual(h.runtime.inputState(), { inputEnabled: false, inputSuspended: true, inputActive: false })
+  h.send({ type: Input.INPUT_UNMUTE })
+  assert.deepEqual(h.runtime.inputState(), { inputEnabled: true, inputSuspended: true, inputActive: false })
+  h.runtime.applyInputSuspension({ suspended: false })
+  assert.deepEqual(h.runtime.inputState(), { inputEnabled: true, inputSuspended: false, inputActive: true })
+  h.runtime.deactivate({ type: 'replacement' })
+  assert.deepEqual(h.runtime.inputState(), { inputEnabled: false, inputSuspended: false, inputActive: false })
+  h.runtime.close()
+  assert.equal(h.runtime.inputState().inputActive, false)
+})

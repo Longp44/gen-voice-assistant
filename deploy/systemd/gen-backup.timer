@@ -1,0 +1,10 @@
+[Unit]
+Description=Gen backup timer (daily)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=gen-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,344 @@
+import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
+import test from 'node:test'
+import { pathToFileURL } from 'node:url'
+import { FrontendKnowledgeRuntime } from '../src/knowledge/runtime.mjs'
+import { KnowledgeLibrary } from '../src/knowledge/providers/local/library.mjs'
+import {
+  LocalKnowledgeProvider,
+} from '../src/knowledge/providers/local/provider.mjs'
+
+const manual = {
+  id: 'doc1',
+  title: '信用卡业务手册',
+  gist: '覆盖开卡与年费两类流程',
+  sections: ['开卡与激活', '年费规则'],
+  path: '/data/workspace/domain/信用卡业务手册.md',
+  filename: '信用卡业务手册.md',
+  body: '# 信用卡业务手册\n\n## 开卡与激活\n收到卡片后完成身份校验。\n\n## 年费规则\n普卡首年免年费。',
+}
+
+function library({ entries = [manual], configured = true } = {}) {
+  return {
+    configured: () => configured,
+    list: ownerId => ownerId === 'owner' ? entries : [],
+    readHead: entry => entry.body || '',
+  }
+}
+
+test('conforms to the knowledge retrieval provider contract', () => {
+  // 通过 FrontendKnowledgeRuntime 构造即等于跑了一遍 assertKnowledgeRetrievalProvider
+  const runtime = new FrontendKnowledgeRuntime({
+    provider: new LocalKnowledgeProvider({ library: library() }),
+  })
+  assert.deepEqual(runtime.capabilities(), ['knowledge'])
+  const described = runtime.describe()
+  assert.equal(described.configured, true)
+  assert.equal(described.provider.protocolVersion, 1)
+  assert.equal(described.provider.key, 'local-domain')
+})
+
+test('returns source text instead of routing retrieval through the backend', async () => {
+  const runtime = new FrontendKnowledgeRuntime({
+    provider: new LocalKnowledgeProvider({ library: library() }),
+  })
+  const output = await runtime.search('年费', { ownerId: 'owner' })
+  const [result] = output.results
+
+  assert.match(result.content, /普卡首年免年费/)
+  assert.match(result.content, /年费规则/)
+  assert.doesNotMatch(result.content, /spawn_thinking|objective/)
+})
+
+test('returns bounded document chunks with private source locators', async () => {
+  const runtime = new FrontendKnowledgeRuntime({
+    provider: new LocalKnowledgeProvider({ library: library() }),
+  })
+  const output = await runtime.search('年费', { ownerId: 'owner' })
+
+  assert.equal(output.status, 'ok')
+  const [result] = output.results
+  assert.match(result.content, /信用卡业务手册/)
+  assert.match(result.content, /普卡首年免年费/)
+  assert.ok(result.content.length < 2000, `片段必须有界，实际 ${result.content.length} 字符`)
+
+  assert.equal(result.source.locator, '年费规则')
+  assert.equal(result.source.uri, undefined)
+  assert.equal(result.citation_id, undefined)
+  assert.deepEqual(output.citations, [])
+})
+
+test('takes the owner from trusted context and never from the model', async () => {
+  // 协议明确要求 Provider 不得从模型参数接受租户身份 —— 否则模型报一个别人的
+  // ownerId 就能读到别人的资料。
+  let seenOwner
+  const provider = new LocalKnowledgeProvider({ library: library() })
+  const original = provider.library.list.bind(provider.library)
+  provider.library.list = ownerId => {
+    seenOwner = ownerId
+    return original(ownerId)
+  }
+  const runtime = new FrontendKnowledgeRuntime({ provider })
+
+  await runtime.search('年费', { ownerId: 'owner' })
+  assert.equal(seenOwner, 'owner')
+
+  // 换一个 owner 就查不到同一份资料
+  const other = await runtime.search('年费', { ownerId: 'someone-else' })
+  assert.equal(other.status, 'not_found')
+  assert.deepEqual(other.results, [])
+})
+
+test('reports unconfigured instead of pretending to be ready', async () => {
+  // 目录没配置时如实报 unconfigured，而不是假装 ready 然后每次检索都空手而归。
+  const runtime = new FrontendKnowledgeRuntime({
+    provider: new LocalKnowledgeProvider({ library: library({ configured: false }) }),
+  })
+  assert.deepEqual(await runtime.health(), {
+    status: 'unconfigured',
+    ok: false,
+    message: '资料库未配置存放目录。',
+  })
+  const output = await runtime.search('年费', { ownerId: 'owner' })
+  assert.equal(output.status, 'not_found')
+})
+
+test('reports not_found when nothing matches', async () => {
+  const runtime = new FrontendKnowledgeRuntime({
+    provider: new LocalKnowledgeProvider({ library: library() }),
+  })
+  const output = await runtime.search('完全无关的东西', { ownerId: 'owner' })
+  assert.equal(output.status, 'not_found')
+  assert.deepEqual(output.results, [])
+})
+
+test('rejects rich documents clearly when no isolated converter is configured', async () => {
+  const provider = new LocalKnowledgeProvider({ library: library() })
+  await assert.rejects(
+    provider.ingest({ source: { path: '/docs/manual.pdf' } }, { ownerId: 'owner' }),
+    error => error.code === 'document_converter_unavailable',
+  )
+})
+
+test('ingestion preserves existing conversion files and refuses a full library before calling agents', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'qwa-local-knowledge-capacity-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const retained = join(root, 'manual.md')
+  writeFileSync(retained, '# Retained original')
+  const shelf = new KnowledgeLibrary({ documentDirectory: root, maxPerOwner: 1 })
+  let conversions = 0
+  let summaries = 0
+  const provider = new LocalKnowledgeProvider({
+    library: shelf,
+    documentConverter: {
+      async convert({ targetPath }) {
+        conversions += 1
+        assert.equal(basename(targetPath), 'manual-2.md')
+        assert.equal(dirname(dirname(targetPath)), root)
+        assert.notEqual(dirname(targetPath), root)
+        writeFileSync(targetPath, '# Converted document')
+      },
+    },
+    summariser: { async maybeRun() { summaries += 1 } },
+  })
+  const { document } = await provider.ingest({ source: { path: '/docs/manual.pdf' } }, { ownerId: 'owner' })
+  assert.equal(document.filename, 'manual-2.md')
+  assert.equal(readFileSync(retained, 'utf8'), '# Retained original')
+  await assert.rejects(
+    provider.ingest({ source: { path: '/docs/another.pdf' } }, { ownerId: 'owner' }),
+    error => error.code === 'library_full',
+  )
+  assert.equal(conversions, 1)
+  assert.equal(summaries, 1)
+  assert.deepEqual(readdirSync(root).sort(), ['manual-2.md', 'manual.md'])
+})
+
+test('updates a converted document in place instead of rejecting at capacity', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'qwa-convert-reimport-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dirA = join(root, 'a')
+  const dirB = join(root, 'b')
+  mkdirSync(dirA)
+  mkdirSync(dirB)
+  const pdf = join(dirA, '手册.pdf')
+  const other = join(dirB, '手册.pdf')
+  writeFileSync(pdf, '%PDF-1.7 fake v1')
+  writeFileSync(other, '%PDF-1.7 other source')
+  const shelf = new KnowledgeLibrary({ documentDirectory: join(root, 'docs'), maxPerOwner: 2 })
+  mkdirSync(join(root, 'docs'))
+  let conversions = 0
+  const provider = new LocalKnowledgeProvider({
+    library: shelf,
+    documentConverter: {
+      async convert({ sourcePath, targetPath }) {
+        conversions += 1
+        writeFileSync(targetPath, `# converted ${sourcePath} ${conversions}\n`)
+      },
+    },
+  })
+
+  const first = await provider.ingest({ source: { path: pdf } }, { ownerId: 'owner' })
+  assert.equal(first.document.filename, '手册.md')
+
+  const sibling = await provider.ingest({ source: { path: other } }, { ownerId: 'owner' })
+  assert.notEqual(sibling.document.id, first.document.id)
+  assert.equal(sibling.document.filename, '手册-2.md')
+  assert.equal(shelf.list('owner').length, 2)
+
+  writeFileSync(pdf, '%PDF-1.7 fake v2')
+  const updated = await provider.ingest({ source: { path: pdf } }, { ownerId: 'owner' })
+  assert.equal(updated.document.id, first.document.id)
+  assert.equal(updated.document.filename, first.document.filename)
+  assert.equal(updated.document.source, pdf)
+  assert.equal(shelf.list('owner').length, 2)
+  assert.equal(readFileSync(first.document.path, 'utf8'), `# converted ${pdf} 3\n`)
+  assert.equal(readFileSync(sibling.document.path, 'utf8'), `# converted ${other} 2\n`)
+  assert.deepEqual(
+    readdirSync(join(root, 'docs')).sort(),
+    ['手册-2.md', '手册.md'],
+  )
+  assert.equal(conversions, 3)
+
+  if (process.platform === 'win32') {
+    const mixedCase = pdf.replace(/^([a-zA-Z])/, letter => (
+      letter === letter.toUpperCase() ? letter.toLowerCase() : letter.toUpperCase()
+    ))
+    const again = await provider.ingest({ source: { path: mixedCase } }, { ownerId: 'owner' })
+    assert.equal(again.document.id, first.document.id)
+    assert.equal(shelf.list('owner').length, 2)
+    assert.deepEqual(
+      readdirSync(join(root, 'docs')).sort(),
+      ['手册-2.md', '手册.md'],
+    )
+  }
+})
+
+for (const failure of ['throw', 'abort', 'missing', 'empty']) {
+  test(`preserves the original and indexed document when reimport conversion fails: ${failure}`, async t => {
+    const root = mkdtempSync(join(tmpdir(), 'qwa-conversion-failure-'))
+    t.after(() => rmSync(root, { recursive: true, force: true }))
+    const pdf = join(root, 'manual.pdf')
+    const original = '%PDF original source'
+    writeFileSync(pdf, original)
+    const docs = join(root, 'docs')
+    const indexPath = join(root, 'index.json')
+    const shelf = new KnowledgeLibrary({ documentDirectory: docs, indexPath })
+    const controller = new AbortController()
+    let conversions = 0
+    const provider = new LocalKnowledgeProvider({ library: shelf, documentConverter: {
+      async convert({ targetPath }) {
+        conversions += 1
+        if (conversions === 1) {
+          writeFileSync(targetPath, '# Existing valid document')
+          return
+        }
+        if (failure === 'missing') return
+        writeFileSync(targetPath, failure === 'empty' ? '' : '# Partial conversion')
+        if (failure === 'throw') throw new Error('converter stopped after partial output')
+        if (failure === 'abort') controller.abort()
+      },
+    } })
+    const first = await provider.ingest({ source: { path: pdf } }, { ownerId: 'owner' })
+    const indexBefore = readFileSync(indexPath, 'utf8')
+    await assert.rejects(
+      provider.ingest({ source: { path: pdf } }, { ownerId: 'owner', signal: controller.signal }),
+      error => {
+        if (failure === 'throw') {
+          assert.equal(error.code, 'document_conversion_failed')
+          assert.match(error.message, /导入未完成.*保持不变/u)
+        } else if (failure === 'abort') assert.equal(error.name, 'AbortError')
+        else assert.equal(error.code, failure === 'missing' ? 'not_found' : 'empty_file')
+        return true
+      },
+    )
+    assert.equal(readFileSync(pdf, 'utf8'), original)
+    assert.equal(readFileSync(first.document.path, 'utf8'), '# Existing valid document')
+    assert.equal(readFileSync(indexPath, 'utf8'), indexBefore)
+    assert.deepEqual(readdirSync(docs), [first.document.filename])
+    assert.equal(shelf.list('owner').length, 1)
+  })
+}
+
+test('cleans failed first conversions without adding a document', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'qwa-first-conversion-failure-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const docs = join(root, 'docs')
+  const pdf = join(root, 'manual.pdf')
+  writeFileSync(pdf, '%PDF original')
+  const shelf = new KnowledgeLibrary({ documentDirectory: docs })
+  const provider = new LocalKnowledgeProvider({ library: shelf, documentConverter: {
+    async convert({ targetPath }) {
+      writeFileSync(targetPath, '# Partial conversion')
+      throw new Error('conversion failed')
+    },
+  } })
+  await assert.rejects(provider.ingest({ source: { path: pdf } }, { ownerId: 'owner' }),
+    error => error.code === 'document_conversion_failed')
+  assert.equal(readFileSync(pdf, 'utf8'), '%PDF original')
+  assert.deepEqual(shelf.list('owner'), [])
+  assert.deepEqual(readdirSync(docs), [])
+})
+
+test('unwraps quoted Explorer paths before converting a document', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'qwa-quoted-convert-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const pdf = join(root, 'manual.pdf')
+  writeFileSync(pdf, '%PDF-1.7 fake')
+  const shelf = new KnowledgeLibrary({ documentDirectory: root })
+  let converted
+  const provider = new LocalKnowledgeProvider({
+    library: shelf,
+    documentConverter: {
+      async convert({ sourcePath, targetPath }) {
+        converted = { sourcePath, targetPath }
+        writeFileSync(targetPath, '# Converted document')
+      },
+    },
+  })
+  const { document } = await provider.ingest(
+    { source: { path: `"${pdf}"` } },
+    { ownerId: 'owner' },
+  )
+  assert.equal(converted.sourcePath, pdf)
+  assert.equal(document.filename, 'manual.md')
+})
+
+test('decodes quoted file URLs before converting documents', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'qwa-url-convert-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const pdf = join(root, '中文 #100%.pdf')
+  writeFileSync(pdf, '%PDF-1.7 fake')
+  let calls = 0
+  const provider = new LocalKnowledgeProvider({
+    library: new KnowledgeLibrary({ documentDirectory: root }),
+    documentConverter: {
+      async convert({ sourcePath, targetPath }) {
+        calls += 1
+        assert.equal(sourcePath, pdf)
+        writeFileSync(targetPath, '# Converted URL document')
+      },
+    },
+  })
+  const { document } = await provider.ingest(
+    { source: { path: `"${pathToFileURL(pdf).href}"` } },
+    { ownerId: 'owner' },
+  )
+  assert.equal(document.filename, '中文 #100%.md')
+  assert.equal(readFileSync(document.path, 'utf8'), '# Converted URL document')
+  for (const path of ['file:///invalid%ZZ.pdf', 'file:///encoded%2Fseparator.pdf']) {
+    await assert.rejects(
+      provider.ingest({ source: { path } }, { ownerId: 'owner' }),
+      { code: 'invalid_path' },
+    )
+  }
+  assert.equal(calls, 1)
+})
+
+test('refuses a library-less construction instead of failing at retrieval time', () => {
+  assert.throws(
+    () => new LocalKnowledgeProvider({}),
+    /requires a document library/,
+  )
+})

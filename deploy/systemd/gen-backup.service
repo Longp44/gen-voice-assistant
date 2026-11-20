@@ -1,0 +1,6 @@
+[Unit]
+Description=Gen backup service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/gen/scripts/gen-backup.sh /opt/gen/runtime /opt/gen/backups

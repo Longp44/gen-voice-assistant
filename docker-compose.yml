@@ -1,0 +1,11 @@
+# 艮（Gèn）docker-compose 快速启动
+# 前置：cp config.env.example runtime/config.env 并填入 DashScope / DeepSeek Key
+services:
+  gen:
+    build: .
+    container_name: gen-gateway
+    ports:
+      - "3201:3201"
+    volumes:
+      - ./runtime:/app/runtime
+    restart: unless-stopped

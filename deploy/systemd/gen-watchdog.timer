@@ -1,0 +1,10 @@
+[Unit]
+Description=Gen watchdog timer (every minute)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+Unit=gen-watchdog.service
+
+[Install]
+WantedBy=timers.target

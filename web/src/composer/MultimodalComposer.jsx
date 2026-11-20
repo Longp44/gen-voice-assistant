@@ -1,0 +1,182 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  MAX_INPUT_FILE_BYTES,
+  createInputFilePart,
+  inputPartLabel,
+  withAttachmentAnchors,
+} from '../../../shared/input-parts.mjs'
+import { t } from '../i18n.js'
+import PhotoCapture from './PhotoCapture.jsx'
+import { blobToBase64 } from './camera-input.js'
+
+function filePart(file, sourceType = 'file') {
+  return new Promise((resolve, reject) => {
+    if (file.size > MAX_INPUT_FILE_BYTES) {
+      reject(new Error(t('文件 {name} 超过 8 MB 限制', { name: file.name })))
+      return
+    }
+    const reader = new FileReader()
+    reader.onerror = () => reject(reader.error || new Error(t('无法读取文件')))
+    reader.onload = () => {
+      resolve({
+        id: crypto.randomUUID(),
+        file: {
+          mime: file.type || 'application/octet-stream',
+          filename: file.name,
+          url: String(reader.result || ''),
+          sourceType,
+        },
+      })
+    }
+    reader.readAsDataURL(file)
+  })
+}
+
+export default function MultimodalComposer({
+  onSend,
+  compact = false,
+  onStartRecording,
+  recording = false,
+  recordingSeconds = 0,
+  onStopRecording,
+  onOpenHistory,
+  trailing = null, // GEN-MOD: 发送按钮前的插槽（主模型/推理强度选择）
+  afterSend = null, // GEN-MOD: 发送按钮之后的插槽（麦克风）
+}) {
+  const [text, setText] = useState('')
+  const [attachments, setAttachments] = useState([])
+  const [error, setError] = useState('')
+  const [photoOpen, setPhotoOpen] = useState(false)
+  const [sheetOpen, setSheetOpen] = useState(false)
+  const picker = useRef(null)
+  const draftGeneration = useRef(0)
+  useEffect(() => () => { draftGeneration.current += 1 }, [])
+
+  const addFiles = useCallback(async (fileList, sourceType = 'file') => {
+    const files = [...fileList]
+    if (!files.length) return
+    const generation = draftGeneration.current
+    try {
+      const next = await Promise.all(files.map(file => filePart(file, sourceType)))
+      if (generation !== draftGeneration.current) return
+      setAttachments(current => generation === draftGeneration.current
+        ? [...current, ...next.map((item, index) => ({
+            id: item.id,
+            part: createInputFilePart(item.file, current.length + index),
+          }))]
+        : current)
+      setError('')
+    } catch (reason) {
+      if (generation !== draftGeneration.current) return
+      setError(reason?.message || String(reason))
+    }
+  }, [])
+
+  const submit = event => {
+    event.preventDefault()
+    const content = text.trim()
+    if (!content && !attachments.length) return
+    const parts = withAttachmentAnchors([
+      ...(content ? [{ type: 'text', text: content }] : []),
+      ...attachments.map(item => item.part),
+    ])
+    if (!onSend(parts)) {
+      setError(t('Gateway 尚未连接'))
+      return
+    }
+    // Reads started for the submitted draft must not populate the next one.
+    draftGeneration.current += 1
+    setText('')
+    setAttachments([])
+    setError('')
+  }
+
+  return <form
+    className="multimodal-composer"
+    onSubmit={submit}
+    onDragOver={event => event.preventDefault()}
+    onDrop={event => {
+      event.preventDefault()
+      addFiles(event.dataTransfer.files)
+    }}
+  >
+    {attachments.length > 0 && <div className="composer-attachments">
+      {attachments.map((item, index) => <span className="composer-attachment" key={item.id}>
+        <span>{inputPartLabel(item.part, index)}</span>
+        <button
+          type="button"
+          aria-label={t('移除附件')}
+          onClick={() => setAttachments(current => current.filter(entry => entry.id !== item.id))}
+        >×</button>
+      </span>)}
+    </div>}
+    {photoOpen && <PhotoCapture
+      onClose={() => setPhotoOpen(false)}
+      onCapture={async (blob, isCurrent) => {
+        const image = await blobToBase64(blob)
+        if (!isCurrent()) return false
+        const id = crypto.randomUUID()
+        const filename = `photo-${Date.now()}.jpg`
+        setAttachments(current => isCurrent() ? [...current, {
+          id, part: createInputFilePart({ mime: 'image/jpeg', filename,
+            url: `data:image/jpeg;base64,${image}` }, current.length),
+        }] : current)
+        setError('')
+        return true
+      }}
+    />}
+    {sheetOpen && <div className="composer-sheet">
+      <button type="button" className="cs-item" onClick={() => { setSheetOpen(false); setPhotoOpen(true) }}>
+        <span className="cs-ico">📷</span><span>拍照</span>
+      </button>
+      <button type="button" className="cs-item" onClick={() => { setSheetOpen(false); picker.current?.click() }}>
+        <span className="cs-ico">🖼</span><span>文件/图片</span>
+      </button>
+      <button type="button" className="cs-item" onClick={() => { setSheetOpen(false); onOpenHistory?.() }}>
+        <span className="cs-ico">🕘</span><span>历史会话</span>
+      </button>
+    </div>}
+    <div className="composer-row">
+      <button
+        className={`composer-attach${sheetOpen ? ' on' : ''}`}
+        type="button"
+        title={t('更多')}
+        aria-label={t('更多')}
+        onClick={() => setSheetOpen(v => !v)}
+      >＋</button>
+      <input
+        ref={picker}
+        type="file"
+        multiple
+        hidden
+        onChange={event => {
+          addFiles(event.target.files)
+          event.target.value = ''
+        }}
+      />
+      <textarea
+        value={text}
+        rows="1"
+        placeholder={compact
+          ? t('输入文字或图片')
+          : t('输入文字，或粘贴、拖入图片和文件')}
+        onChange={event => setText(event.target.value)}
+        onPaste={event => {
+          const files = event.clipboardData?.files
+          if (!files?.length) return
+          event.preventDefault()
+          addFiles(files, 'clipboard')
+        }}
+        onKeyDown={event => {
+          // Enter may confirm an IME candidate instead of sending the draft.
+          if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
+          if (event.key === 'Enter' && !event.shiftKey) submit(event)
+        }}
+      />
+      {trailing}
+      <button className="composer-send" type="submit">{t('发送')}</button>
+      {afterSend}
+    </div>
+    {error && <small className="composer-error" role="alert">{error}</small>}
+  </form>
+}

@@ -1,0 +1,20 @@
+[Unit]
+Description=Gen voice assistant gateway
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/gen
+EnvironmentFile=-/opt/gen/runtime/config.env
+Environment=QWAUDIO_CONFIG_DIR=/opt/gen/runtime
+Environment=QWAUDIO_STATE_DIR=/opt/gen/runtime/state
+Environment=QWAUDIO_DATA_DIR=/opt/gen/runtime/data
+Environment=DSH_HOME=/opt/gen/runtime/dsh-home
+Environment=QWEN_AUDIO_AGENT_COMPUTER_USE=false
+ExecStart=/usr/bin/node cli/bin/qwenaudio.mjs gateway
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

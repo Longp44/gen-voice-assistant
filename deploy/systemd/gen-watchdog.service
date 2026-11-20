@@ -1,0 +1,6 @@
+[Unit]
+Description=Gen watchdog service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gen/deploy/systemd/gen-watchdog.sh
