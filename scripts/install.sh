@@ -11,8 +11,12 @@ if [ -z "$NODE_VER" ]; then
 fi
 MAJOR=$(echo "$NODE_VER" | cut -d. -f1)
 MINOR=$(echo "$NODE_VER" | cut -d. -f2)
-if [ "$MAJOR" = "22" ] && [ "$MINOR" -lt 22 ] || [ "$MAJOR" = "24" ] && [ "$MINOR" -lt 15 ] && [ "$MAJOR" -lt "26" ]; then
-  echo "错误：Node.js v$NODE_VER 版本过低，需要 ^22.22.2 || ^24.15.0（当前 v$NODE_VER）" >&2
+ok=0
+{ [ "$MAJOR" = "22" ] && [ "$MINOR" -ge 22 ]; } && ok=1
+{ [ "$MAJOR" = "24" ] && [ "$MINOR" -ge 15 ]; } && ok=1
+[ "$MAJOR" -ge 26 ] 2>/dev/null && ok=1
+if [ "$ok" = "0" ]; then
+  echo "错误：Node.js v$NODE_VER 版本过低，需要 ^22.22.2 || ^24.15.0（当前 v${NODE_VER}）" >&2
   exit 1
 fi
 echo "==> Node.js v$NODE_VER 符合要求"
